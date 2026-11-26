@@ -72,3 +72,41 @@ def test_csv_export(store):
     store.checkout([item(p, 1)], "Transfer", 0)
     out = store.export_csv()
     assert out.startswith("\ufeffNo Struk") and "Transfer" in out
+
+
+def test_add_edit_delete_menu(store):
+    pid = store.add_product(" mc x ", "Macaroni Spesial", "Size L", 25000, 12000)
+    p = [x for x in store.products() if x["id"] == pid][0]
+    assert p["code"] == "MC X" and p["stock"] == 0
+    assert "MC X" in store.codes()
+
+    store.update_product(pid, "MC X", "Macaroni Super", "Size M", 22000, 11000)
+    p = [x for x in store.products() if x["id"] == pid][0]
+    assert (p["name"], p["size"], p["price"]) == ("Macaroni Super", "Size M", 22000)
+
+    store.delete_product(pid)
+    assert all(x["id"] != pid for x in store.products())
+    assert "MC X" not in store.codes()
+
+
+def test_menu_validation(store):
+    with pytest.raises(ValueError):
+        store.add_product("", "Tanpa kode", "Size M", 10000, 5000)
+    with pytest.raises(ValueError):
+        store.add_product("MC", "Gratis", "Size M", 0, 0)
+
+
+def test_checkout_deleted_menu_is_rejected(store):
+    p = store.products()[0]
+    store.set_stock(p["id"], 5)
+    store.delete_product(p["id"])
+    with pytest.raises(CheckoutError, match="dihapus"):
+        store.checkout([item(p, 1)], "Tunai", 10000)
+
+
+def test_delete_menu_keeps_history(store):
+    p = store.products()[0]
+    store.set_stock(p["id"], 1)
+    store.checkout([item(p, 1)], "Tunai", 10000)
+    store.delete_product(p["id"])
+    assert store.stats()["count"] == 1

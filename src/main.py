@@ -10,7 +10,7 @@ from datetime import datetime
 import flet as ft
 
 from core import (
-    CODES, MAYO_OPTIONS, PAYMENT_METHODS, SIZES, SPICE_LEVELS,
+    MAYO_OPTIONS, PAYMENT_METHODS, SIZES, SPICE_LEVELS,
     CheckoutError, Store, format_rp, receipt_text,
 )
 
@@ -153,6 +153,10 @@ class PosApp:
             self.code_filter = c
             self.refresh()
 
+        codes = self.store.codes()
+        if self.code_filter not in codes:
+            self.code_filter = "ALL"
+
         size_row = ft.Row(
             [chip("Semua" if s == "ALL" else s, self.size_filter == s, lambda e, s=s: set_size(s))
              for s in ["ALL"] + SIZES],
@@ -160,7 +164,7 @@ class PosApp:
         )
         code_row = ft.Row(
             [chip("Semua" if c == "ALL" else c, self.code_filter == c, lambda e, c=c: set_code(c))
-             for c in ["ALL"] + CODES],
+             for c in ["ALL"] + codes],
             spacing=6,
             scroll=ft.ScrollMode.HIDDEN,
         )
@@ -473,19 +477,23 @@ class PosApp:
         )
         self.page.show_dialog(sheet)
 
-    def show_receipt(self, result):
+    def show_receipt(self, result, title="Transaksi berhasil"):
         text = receipt_text(result)
 
         async def share(e):
             # Membuka menu Bagikan Android/iOS: pilih WhatsApp, lalu kirim ke pelanggan.
-            await self.share.share_text(text, subject="Struk Macaroni Holic")
+            try:
+                await self.share.share_text(text, subject="Struk Macaroni Holic")
+            except Exception:
+                await self.clipboard.set(text)
+                self.toast("Menu Bagikan tidak tersedia di sini. Struk disalin ke clipboard.")
 
         async def copy(e):
             await self.clipboard.set(text)
             self.toast("Struk disalin ke clipboard.")
 
         dialog = ft.AlertDialog(
-            title=ft.Text("Transaksi berhasil", color=PURPLE, weight=ft.FontWeight.BOLD),
+            title=ft.Text(title, color=PURPLE, weight=ft.FontWeight.BOLD),
             content=ft.Container(
                 content=ft.Column(
                     [ft.Text(text, font_family="monospace", size=12, selectable=True, color=TEXT)],
@@ -524,9 +532,17 @@ class PosApp:
                 ft.Container(
                     ft.Row(
                         [
-                            ft.Text("Stok harian", size=18, weight=ft.FontWeight.BOLD, color=PURPLE),
-                            ft.TextButton("Kosongkan semua", icon=ft.Icons.DELETE_SWEEP,
-                                          style=ft.ButtonStyle(color=DANGER), on_click=confirm_reset),
+                            ft.Text("Menu & stok", size=18, weight=ft.FontWeight.BOLD, color=PURPLE),
+                            ft.Row(
+                                [
+                                    ft.FilledButton("Menu", icon=ft.Icons.ADD, bgcolor=PURPLE, color=YELLOW,
+                                                    tooltip="Tambah menu baru",
+                                                    on_click=lambda e: self.open_menu_form()),
+                                    ft.IconButton(ft.Icons.DELETE_SWEEP, icon_color=DANGER,
+                                                  tooltip="Kosongkan semua stok", on_click=confirm_reset),
+                                ],
+                                spacing=0,
+                            ),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
@@ -573,8 +589,12 @@ class PosApp:
                         pill(p["size"], YELLOW if p["size"] == "Size L" else PURPLE_SOFT, PURPLE_DARK),
                         ft.Container(expand=True),
                         ft.Text(f"{p['stock']} porsi", weight=ft.FontWeight.BOLD, color=stock_color(p["stock"])),
+                        ft.IconButton(ft.Icons.EDIT_NOTE, icon_color=PURPLE, icon_size=22, tooltip="Edit menu",
+                                      on_click=lambda e: self.open_menu_form(p)),
+                        ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=DANGER, icon_size=22, tooltip="Hapus menu",
+                                      on_click=lambda e: self.confirm_delete(p)),
                     ],
-                    spacing=6,
+                    spacing=0,
                 ),
                 ft.Text(p["name"], weight=ft.FontWeight.BOLD, color=TEXT),
                 ft.Text(f"Jual {format_rp(p['price'])}  •  Modal {format_rp(p['cost'])}", size=12, color=MUTED),
@@ -590,6 +610,134 @@ class PosApp:
             spacing=6,
         ), padding=12)
 
+    def open_menu_form(self, p=None):
+        """Dialog tambah menu (p=None) atau edit menu yang sudah ada."""
+        editing = p is not None
+        p = p or {"code": "", "name": "", "size": "Size M", "price": "", "cost": "", "stock": 0}
+
+        field_style = dict(
+            dense=True, filled=True, fill_color="#F6F5F9", border_color="#E4E1EC",
+            focused_border_color=PURPLE, border_radius=10, text_size=14,
+            content_padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+        )
+
+        def text_field(value, **kw):
+            return ft.TextField(value=str(value), **field_style, **kw)
+
+        def num_field(value):
+            return text_field(value, keyboard_type=ft.KeyboardType.NUMBER,
+                              input_filter=ft.NumbersOnlyInputFilter())
+
+        def labeled(label, control, expand=True):
+            return ft.Column(
+                [ft.Text(f"{label} *", size=12, weight=ft.FontWeight.BOLD, color=TEXT), control],
+                spacing=6, expand=expand,
+            )
+
+        code = text_field(p["code"], capitalization=ft.TextCapitalization.CHARACTERS)
+        name = text_field(p["name"])
+        size = ft.Dropdown(
+            value=p["size"], editable=True, expand=True,
+            options=[ft.DropdownOption(key=s, text=s) for s in SIZES],
+            **field_style,
+        )
+        cost = num_field(p["cost"])
+        price = num_field(p["price"])
+        stock = num_field(p["stock"])
+        error = ft.Text("", color=DANGER, size=12, visible=False)
+
+        def save(e):
+            try:
+                args = (code.value or "", name.value or "", size.value or "",
+                        int(price.value or 0), int(cost.value or 0))
+                if editing:
+                    self.store.update_product(p["id"], *args)
+                    self.store.set_stock(p["id"], int(stock.value or 0))
+                else:
+                    self.store.add_product(*args, stock=int(stock.value or 0))
+            except ValueError as err:
+                error.value = str(err) if "invalid literal" not in str(err) else "Harga harus berupa angka."
+                error.visible = True
+                error.update()
+                return
+            self.page.pop_dialog()
+            self.toast("Menu diperbarui." if editing else "Menu baru ditambahkan.")
+            self.refresh()
+
+        title = f"Edit Menu [{p['code']}] - {p['size']}" if editing else "Tambah Menu Baru"
+        header = ft.Container(
+            bgcolor=PURPLE,
+            padding=ft.Padding.only(left=20, right=8, top=8, bottom=8),
+            content=ft.Row(
+                [
+                    ft.Text(title, size=16, weight=ft.FontWeight.BOLD, color=WHITE, expand=True),
+                    ft.IconButton(ft.Icons.CLOSE, icon_color=WHITE, icon_size=18, tooltip="Tutup",
+                                  style=ft.ButtonStyle(bgcolor="#33FFFFFF", shape=ft.CircleBorder()),
+                                  on_click=lambda e: self.page.pop_dialog()),
+                ],
+            ),
+        )
+        body = ft.Container(
+            padding=ft.Padding.only(left=20, right=20, top=20, bottom=20),
+            content=ft.Column(
+                [
+                    ft.Row([labeled("Kode Menu", code), labeled("Ukuran", size)], spacing=12,
+                           vertical_alignment=ft.CrossAxisAlignment.START),
+                    labeled("Nama Menu", name, expand=False),
+                    ft.Row([labeled("Modal / HPP (Rp)", cost), labeled("Harga Jual (Rp)", price)], spacing=12),
+                    labeled("Stok Porsi Saat Ini", stock, expand=False),
+                    error,
+                    ft.Divider(height=8, color="#ECE9F2"),
+                    ft.Row(
+                        [
+                            ft.OutlinedButton(
+                                "Batal", expand=True, height=46,
+                                style=ft.ButtonStyle(color=TEXT, shape=ft.RoundedRectangleBorder(radius=10)),
+                                on_click=lambda e: self.page.pop_dialog(),
+                            ),
+                            ft.FilledButton(
+                                "Simpan Menu", expand=True, height=46, bgcolor=PURPLE, color=YELLOW,
+                                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)),
+                                on_click=save,
+                            ),
+                        ],
+                        spacing=12,
+                    ),
+                ],
+                tight=True, spacing=14, scroll=ft.ScrollMode.AUTO,
+            ),
+        )
+
+        self.page.show_dialog(ft.AlertDialog(
+            bgcolor=WHITE,
+            shape=ft.RoundedRectangleBorder(radius=16),
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            title_padding=0,
+            content_padding=0,
+            inset_padding=ft.Padding.symmetric(horizontal=16, vertical=24),
+            content=ft.Container(ft.Column([header, body], tight=True, spacing=0), width=400),
+        ))
+
+    def confirm_delete(self, p):
+        def do_delete(e):
+            self.store.delete_product(p["id"])
+            self.cart = [i for i in self.cart if i["pid"] != p["id"]]
+            self.page.pop_dialog()
+            self.toast(f"Menu [{p['code']}] {p['size']} dihapus.")
+            self.refresh()
+
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Hapus menu?"),
+            content=ft.Text(
+                f"[{p['code']}] {p['name']} ({p['size']}) akan dihapus dari daftar menu. "
+                "Riwayat transaksi yang sudah ada tidak ikut terhapus."
+            ),
+            actions=[
+                ft.TextButton("Batal", on_click=lambda e: self.page.pop_dialog()),
+                ft.FilledButton("Hapus", bgcolor=DANGER, color=WHITE, on_click=do_delete),
+            ],
+        ))
+
     # ================= TAB LAPORAN =================
     def build_report(self):
         prefix = datetime.now().strftime("%Y-%m-%d") if self.report_today else ""
@@ -603,19 +751,26 @@ class PosApp:
         async def export(e):
             data = self.store.export_csv(prefix).encode("utf-8")
             name = f"Laporan_Macaroni_Holic_{datetime.now():%Y%m%d}.csv"
-            if self.page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS):
-                await self.share.share_files(
-                    [ft.ShareFile.from_bytes(data, mime_type="text/csv", name=name)],
-                    subject="Laporan Macaroni Holic",
+            try:
+                if not self.page.web and self.page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS):
+                    await self.share.share_files(
+                        [ft.ShareFile.from_bytes(data, mime_type="text/csv", name=name)],
+                        subject="Laporan Macaroni Holic",
+                    )
+                    return
+                if self.page.web:
+                    # Di browser file langsung diunduh.
+                    await self.file_picker.save_file(file_name=name, src_bytes=data)
+                    return
+                path = await self.file_picker.save_file(
+                    dialog_title="Simpan laporan", file_name=name, allowed_extensions=["csv"],
                 )
-                return
-            path = await self.file_picker.save_file(
-                dialog_title="Simpan laporan", file_name=name, allowed_extensions=["csv"],
-            )
-            if path:
-                with open(path, "wb") as f:
-                    f.write(data)
-                self.toast(f"Laporan disimpan ke {path}")
+                if path:
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    self.toast(f"Laporan disimpan ke {path}")
+            except Exception as err:
+                self.toast(f"Gagal export laporan: {err}", DANGER)
 
         def stat(title, value, color):
             return ft.Container(card(ft.Column(
@@ -624,26 +779,7 @@ class PosApp:
                 spacing=2,
             ), padding=12), col={"xs": 12, "sm": 4})
 
-        trx_cards = [
-            card(ft.Column(
-                [
-                    ft.Row(
-                        [ft.Text(t["trx_code"], weight=ft.FontWeight.BOLD, color=PURPLE),
-                         pill(t["payment_method"], PURPLE_SOFT, PURPLE_DARK)],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    ),
-                    ft.Text(t["created_at"], size=12, color=MUTED),
-                    ft.Text(t["items_summary"].replace("; ", "\n"), size=12, color=TEXT),
-                    ft.Row(
-                        [ft.Text(f"Total {format_rp(t['total'])}", weight=ft.FontWeight.BOLD),
-                         ft.Text(f"Laba {format_rp(t['profit'])}", color=SUCCESS, weight=ft.FontWeight.BOLD)],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    ),
-                ],
-                spacing=4,
-            ), padding=12)
-            for t in trxs
-        ] or [ft.Text("Belum ada transaksi.", color=MUTED)]
+        trx_cards = [self.trx_card(t) for t in trxs] or [ft.Text("Belum ada transaksi.", color=MUTED)]
 
         return ft.Container(
             ft.Column(
@@ -671,6 +807,289 @@ class PosApp:
             padding=12,
             expand=True,
         )
+
+
+    # ================= EDIT / HAPUS TRANSAKSI =================
+    def trx_card(self, t):
+        has_items = bool(self.store.transaction_items(t["id"]))
+
+        def show(e):
+            self.show_receipt(self.store.receipt(t["id"]), title=f"Struk {t['trx_code']}")
+
+        actions = []
+        if has_items:
+            actions.append(ft.IconButton(ft.Icons.RECEIPT_LONG, icon_color=PURPLE, icon_size=20,
+                                         tooltip="Lihat / bagikan struk", on_click=show))
+        actions += [
+            ft.IconButton(ft.Icons.EDIT_NOTE, icon_color=PURPLE, icon_size=22, tooltip="Edit transaksi",
+                          on_click=lambda e: self.open_trx_edit(t)),
+            ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=DANGER, icon_size=22, tooltip="Hapus transaksi",
+                          on_click=lambda e: self.confirm_trx_delete(t, has_items)),
+        ]
+        time_line = [ft.Text(t["created_at"], size=12, color=MUTED)]
+        if t.get("edited_at"):
+            time_line.append(pill(f"Diedit {t['edited_at'][11:16]}", "#FEF0C7", "#93370D", size=10))
+
+        return card(ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text(t["trx_code"], weight=ft.FontWeight.BOLD, color=PURPLE),
+                        pill(t["payment_method"], PURPLE_SOFT, PURPLE_DARK),
+                        ft.Container(expand=True),
+                        *actions,
+                    ],
+                    spacing=0,
+                ),
+                ft.Row(time_line, spacing=8),
+                ft.Text(t["items_summary"].replace("; ", "\n"), size=12, color=TEXT),
+                ft.Row(
+                    [ft.Text(f"Total {format_rp(t['total'])}", weight=ft.FontWeight.BOLD),
+                     ft.Text(f"Laba {format_rp(t['profit'])}", color=SUCCESS, weight=ft.FontWeight.BOLD)],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+            ],
+            spacing=4,
+        ), padding=12)
+
+    def open_trx_edit(self, t):
+        legacy = not self.store.transaction_items(t["id"])
+        items = None if legacy else self.store.transaction_items(t["id"])
+        state = {"method": t["payment_method"]}
+
+        field_style = dict(
+            dense=True, filled=True, fill_color="#F6F5F9", border_color="#E4E1EC",
+            focused_border_color=PURPLE, border_radius=10, text_size=14,
+            content_padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+        )
+
+        def section(label):
+            return ft.Text(label, size=12, weight=ft.FontWeight.BOLD, color=TEXT)
+
+        total_of = lambda: t["total"] if legacy else sum(i["price"] * i["qty"] for i in items)
+        cash = ft.TextField(value=str(t["cash_paid"]), keyboard_type=ft.KeyboardType.NUMBER,
+                            input_filter=ft.NumbersOnlyInputFilter(), expand=True, **field_style)
+        total_text = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color=PURPLE)
+        change_text = ft.Text("", size=14, weight=ft.FontWeight.BOLD)
+        error = ft.Text("", color=DANGER, size=12, visible=False)
+        items_col = ft.Column(spacing=6)
+
+        def recalc(update=True):
+            total = total_of()
+            diff = int(cash.value or 0) - total
+            total_text.value = format_rp(total)
+            change_text.value = format_rp(diff) if diff >= 0 else "Kurang " + format_rp(-diff)
+            change_text.color = SUCCESS if diff >= 0 else DANGER
+            if update:
+                total_text.update()
+                change_text.update()
+
+        def set_qty(idx, d):
+            items[idx]["qty"] += d
+            if items[idx]["qty"] <= 0:
+                items.pop(idx)
+            render_items()
+            items_col.update()
+            recalc()
+
+        def render_items():
+            if not items:
+                items_col.controls = [ft.Text("Belum ada item. Tambahkan minimal satu item, "
+                                              "atau hapus transaksinya.", size=12, color=DANGER)]
+                return
+            items_col.controls = [
+                ft.Container(
+                    bgcolor="#F6F5F9", border_radius=10, padding=ft.Padding.only(left=12, right=4, top=6, bottom=6),
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(f"[{it['code']}] {it['size']}", weight=ft.FontWeight.BOLD, size=13),
+                                    ft.Text(f"{it['spice']}, {it['mayo']}", size=11, color=MUTED),
+                                    ft.Text(format_rp(it["price"] * it["qty"]), size=12, color=PURPLE,
+                                            weight=ft.FontWeight.BOLD),
+                                ],
+                                spacing=0, expand=True,
+                            ),
+                            ft.IconButton(ft.Icons.REMOVE_CIRCLE_OUTLINE, icon_color=PURPLE, icon_size=22,
+                                          on_click=lambda e, i=idx: set_qty(i, -1)),
+                            ft.Text(str(it["qty"]), size=16, weight=ft.FontWeight.BOLD, width=24,
+                                    text_align=ft.TextAlign.CENTER),
+                            ft.IconButton(ft.Icons.ADD_CIRCLE, icon_color=PURPLE, icon_size=22,
+                                          on_click=lambda e, i=idx: set_qty(i, 1)),
+                            ft.IconButton(ft.Icons.DELETE_OUTLINE, icon_color=DANGER, icon_size=20,
+                                          tooltip="Hapus item", on_click=lambda e, i=idx: set_qty(i, -items[i]["qty"])),
+                        ],
+                        spacing=0,
+                    ),
+                )
+                for idx, it in enumerate(items)
+            ]
+
+        products = {str(p["id"]): p for p in self.store.products()}
+        new_menu = ft.Dropdown(
+            hint_text="Pilih menu", expand=True, **field_style,
+            options=[ft.DropdownOption(key=k, text=f"[{p['code']}] {p['size']} - {format_rp(p['price'])}")
+                     for k, p in products.items()],
+        )
+
+        def add_item(e):
+            p = products.get(new_menu.value or "")
+            if not p:
+                return
+            for it in items:
+                if (it["pid"], it["spice"], it["mayo"]) == (p["id"], "Pedas Sedang", "Mayo Normal"):
+                    it["qty"] += 1
+                    break
+            else:
+                items.append({"pid": p["id"], "code": p["code"], "name": p["name"], "size": p["size"],
+                              "price": p["price"], "cost": p["cost"], "qty": 1,
+                              "spice": "Pedas Sedang", "mayo": "Mayo Normal"})
+            render_items()
+            items_col.update()
+            recalc()
+
+        def on_method(e):
+            state["method"] = list(e.control.selected)[0]
+            if state["method"] != "Tunai":
+                cash.value = str(total_of())
+                cash.update()
+            recalc()
+
+        def exact(e):
+            cash.value = str(total_of())
+            cash.update()
+            recalc()
+
+        def save(e):
+            try:
+                self.store.update_transaction(t["id"], items, state["method"], int(cash.value or 0))
+            except CheckoutError as err:
+                error.value = str(err)
+                error.visible = True
+                error.update()
+                return
+            self.page.pop_dialog()
+            self.toast(f"Transaksi {t['trx_code']} diperbarui.")
+            self.refresh()
+
+        cash.on_change = lambda e: recalc()
+        recalc(update=False)
+
+        if legacy:
+            item_section = [
+                section("Detail pesanan"),
+                ft.Container(
+                    bgcolor="#FEF0C7", border_radius=10, padding=12,
+                    content=ft.Text(
+                        "Transaksi ini dibuat sebelum detail item disimpan, jadi item-nya tidak bisa diubah. "
+                        "Metode bayar dan uang diterima tetap bisa diedit.\n\n"
+                        + t["items_summary"].replace("; ", "\n"),
+                        size=12, color="#93370D",
+                    ),
+                ),
+            ]
+        else:
+            render_items()
+            item_section = [
+                section("Item pesanan"),
+                items_col,
+                ft.Row([new_menu, ft.FilledButton("Tambah", icon=ft.Icons.ADD, bgcolor=PURPLE, color=YELLOW,
+                                                  height=44, on_click=add_item)], spacing=8),
+                ft.Text("Item tambahan memakai saus Pedas Sedang & Mayo Normal.", size=11, color=MUTED),
+            ]
+
+        header = ft.Container(
+            bgcolor=PURPLE,
+            padding=ft.Padding.only(left=20, right=8, top=8, bottom=8),
+            content=ft.Row(
+                [
+                    ft.Column(
+                        [ft.Text(f"Edit Transaksi {t['trx_code']}", size=16, weight=ft.FontWeight.BOLD,
+                                 color=WHITE),
+                         ft.Text(t["created_at"], size=11, color="#D9D0EC")],
+                        spacing=0, expand=True,
+                    ),
+                    ft.IconButton(ft.Icons.CLOSE, icon_color=WHITE, icon_size=18, tooltip="Tutup",
+                                  style=ft.ButtonStyle(bgcolor="#33FFFFFF", shape=ft.CircleBorder()),
+                                  on_click=lambda e: self.page.pop_dialog()),
+                ],
+            ),
+        )
+        body = ft.Container(
+            padding=20,
+            content=ft.Column(
+                [
+                    *item_section,
+                    ft.Divider(height=8, color="#ECE9F2"),
+                    section("Metode bayar"),
+                    ft.SegmentedButton(
+                        selected=[t["payment_method"]],
+                        segments=[ft.Segment(value=m, label=ft.Text(m)) for m in PAYMENT_METHODS],
+                        on_change=on_method,
+                    ),
+                    section("Uang diterima (Rp)"),
+                    ft.Row([cash, ft.OutlinedButton("Uang pas", height=44, on_click=exact)], spacing=8),
+                    ft.Row([ft.Text("Total", weight=ft.FontWeight.BOLD), total_text],
+                           alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row([ft.Text("Kembalian", weight=ft.FontWeight.BOLD), change_text],
+                           alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Text("Stok porsi otomatis disesuaikan dengan perubahan jumlah item.", size=11, color=MUTED)
+                    if not legacy else ft.Container(),
+                    error,
+                    ft.Row(
+                        [
+                            ft.OutlinedButton(
+                                "Batal", expand=True, height=46,
+                                style=ft.ButtonStyle(color=TEXT, shape=ft.RoundedRectangleBorder(radius=10)),
+                                on_click=lambda e: self.page.pop_dialog(),
+                            ),
+                            ft.FilledButton(
+                                "Simpan Perubahan", expand=True, height=46, bgcolor=PURPLE, color=YELLOW,
+                                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)),
+                                on_click=save,
+                            ),
+                        ],
+                        spacing=12,
+                    ),
+                ],
+                tight=True, spacing=12, scroll=ft.ScrollMode.AUTO,
+            ),
+        )
+        self.page.show_dialog(ft.AlertDialog(
+            bgcolor=WHITE,
+            shape=ft.RoundedRectangleBorder(radius=16),
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            title_padding=0,
+            content_padding=0,
+            inset_padding=ft.Padding.symmetric(horizontal=16, vertical=24),
+            content=ft.Container(ft.Column([header, body], tight=True, spacing=0), width=420),
+        ))
+
+    def confirm_trx_delete(self, t, has_items):
+        restore = ft.Checkbox(label="Kembalikan stok porsi", value=True, active_color=PURPLE, visible=has_items)
+
+        def do_delete(e):
+            self.store.delete_transaction(t["id"], restore_stock=has_items and bool(restore.value))
+            self.page.pop_dialog()
+            self.toast(f"Transaksi {t['trx_code']} dihapus.")
+            self.refresh()
+
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Hapus transaksi?"),
+            content=ft.Column(
+                [
+                    ft.Text(f"{t['trx_code']} ({format_rp(t['total'])}) akan dihapus dari laporan. "
+                            "Ini tidak bisa dibatalkan."),
+                    restore,
+                ],
+                tight=True,
+            ),
+            actions=[
+                ft.TextButton("Batal", on_click=lambda e: self.page.pop_dialog()),
+                ft.FilledButton("Hapus", bgcolor=DANGER, color=WHITE, on_click=do_delete),
+            ],
+        ))
 
 
 def main(page: ft.Page):
